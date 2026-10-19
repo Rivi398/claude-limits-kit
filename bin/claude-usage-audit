@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+"use strict";
+
+// Where does your Claude Code usage go? Reads the local session logs in ~/.claude/projects
+// and reports metadata only: token counts, tool names, sizes. It never prints messages,
+// prompts, tool arguments, tool output or credentials, and sends nothing anywhere.
+//
+// Usage: claude-usage-audit [--days N] [--json]
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const readline = require("readline");
+
+const args = process.argv.slice(2);
+if (args.includes("--help") || args.includes("-h")) {
+  console.log("Usage: claude-usage-audit [--days N] [--json]\n\nN is 1..99, default 7.");
+  process.exit(0);
+}
+const asJson = args.includes("--json");
+let days = 7;
+const di = args.indexOf("--days");
+if (di !== -1) {
+  if (!/^[1-9][0-9]?$/.test(args[di + 1] || "")) {
+    console.error("claude-usage-audit: --days takes a number 1..99");
+    process.exit(64);
+  }
+  days = Number(args[di + 1]);
+}
+
+const root = path.join(os.homedir(), ".claude", "projects");
+const cutoff = Date.now() - days * 86400000;
+
+function collect(dir, out) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const target = path.join(dir, entry.name);
+    if (entry.isDirectory()) collect(target, out);
+    else if (entry.isFile() && target.endsWith(".jsonl")) {
+      try {
+        if (fs.statSync(target).mtimeMs >= cutoff) out.push(target);
+      } catch {
+        // A session file can disappear while we read; skip it.
+      }
+    }
+  }
+  return out;
+}
+
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const bytes = (v) => Buffer.byteLength(JSON.stringify(v ?? ""), "utf8"); // size only, never kept
+
+async function main() {
+  if (!fs.existsSync(root)) throw new Error(`no Claude Code logs at ${root}`);
+  const files = collect(root, []);
+
+  // "Context volume": the sum of the context size of every API call. Each step of an agent
+  // re-reads its whole context, so this is the best local proxy for what eats the limits.
+  const total = { calls: 0, volume: 0, sideCalls: 0, sideVolume: 0, bigCalls: 0, bigVolume: 0 };
+  const sessions = new Map();
+  const toolCalls = new Map();
+  const toolBytes = new Map();
+  const toolById = new Map();
+
+  for (const file of files) {
+    const project = path.basename(path.dirname(file.includes(`${path.sep}subagents${path.sep}`)
+      ? path.dirname(path.dirname(file)) : file));
+    const input = readline.createInterface({ input: fs.createReadStream(file, "utf8"), crlfDelay: Infinity });
+    for await (const line of input) {
+      if (!line) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+
+      const id = e.sessionId || file;
+      if (!sessions.has(id)) sessions.set(id, { id, project, volume: 0, sideVolume: 0, first: Infinity, last: -Infinity });
+      const s = sessions.get(id);
+      const t = Date.parse(e.timestamp);
+      if (Number.isFinite(t)) { s.first = Math.min(s.first, t); s.last = Math.max(s.last, t); }
+
+      const msg = e.message || {};
+      if (e.type === "assistant" && msg.usage && msg.model !== "<synthetic>") {
+        const u = msg.usage;
+        const ctx = num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens);
+        if (ctx) {
+          total.calls += 1; total.volume += ctx; s.volume += ctx;
+          if (e.isSidechain) { total.sideCalls += 1; total.sideVolume += ctx; s.sideVolume += ctx; }
+          if (ctx >= 150000) { total.bigCalls += 1; total.bigVolume += ctx; }
+        }
+      }
+      for (const b of Array.isArray(msg.content) ? msg.content : []) {
+        if (b && b.type === "tool_use" && b.id && typeof b.name === "string") {
+          toolById.set(b.id, b.name);
+          toolCalls.set(b.name, (toolCalls.get(b.name) || 0) + 1);
+        } else if (b && b.type === "tool_result") {
+          const name = toolById.get(b.tool_use_id) || "(unknown)";
+          toolBytes.set(name, (toolBytes.get(name) || 0) + bytes(b.content));
+        }
+      }
+    }
+  }
+
+  const pct = (a, b) => (b ? Math.round((1000 * a) / b) / 10 : 0);
+  const list = [...sessions.values()].filter((s) => s.volume > 0);
+  const report = {
+    windowDays: days,
+    sessions: list.length,
+    apiCalls: total.calls,
+    contextVolumeMTokens: Math.round(total.volume / 1e5) / 10,
+    subagentShareOfVolumePct: pct(total.sideVolume, total.volume),
+    callsAt150kPlusPct: pct(total.bigCalls, total.calls),
+    volumeFromCallsAt150kPlusPct: pct(total.bigVolume, total.volume),
+    topSessions: list.sort((a, b) => b.volume - a.volume).slice(0, 5).map((s) => ({
+      project: s.project,
+      session: s.id.slice(0, 8),
+      volumePct: pct(s.volume, total.volume),
+      subagentPct: pct(s.sideVolume, s.volume),
+      hours: Number.isFinite(s.first) ? Math.round((s.last - s.first) / 360000) / 10 : 0,
+    })),
+    toolsByResultSize: [...toolBytes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([name, b]) => ({ name, resultMiB: Math.round(b / 104857.6) / 10, calls: toolCalls.get(name) || 0 })),
+    note: "Local proxy from your logs, not Anthropic's billing numbers.",
+  };
+
+  if (asJson) return console.log(JSON.stringify(report, null, 2));
+
+  const r = report;
+  console.log(`Claude Code usage, last ${r.windowDays} days (local logs, metadata only)\n`);
+  console.log(`  sessions                  ${r.sessions}`);
+  console.log(`  API calls                 ${r.apiCalls}`);
+  console.log(`  context re-read           ${r.contextVolumeMTokens}M tokens`);
+  console.log(`  ...by subagents           ${r.subagentShareOfVolumePct}%`);
+  console.log(`  ...by calls with 150k+    ${r.volumeFromCallsAt150kPlusPct}%  (${r.callsAt150kPlusPct}% of calls)\n`);
+  console.log("Heaviest sessions:");
+  for (const s of r.topSessions) {
+    console.log(`  ${String(s.volumePct).padStart(5)}%  ${s.session}  ${s.hours}h  subagents ${s.subagentPct}%  ${s.project}`);
+  }
+  console.log("\nTools that put the most into context:");
+  for (const t of r.toolsByResultSize) {
+    console.log(`  ${String(t.resultMiB).padStart(7)} MiB  ${String(t.calls).padStart(6)} calls  ${t.name}`);
+  }
+  console.log(`\n${r.note}`);
+  if (r.subagentShareOfVolumePct >= 50) {
+    console.log("Subagents dominate: the context budget hook in this kit is likely to help.");
+  }
+}
+
+main().catch((err) => {
+  console.error(`claude-usage-audit: ${err.message}`);
+  process.exit(1);
+});

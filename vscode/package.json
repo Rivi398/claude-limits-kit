@@ -1,0 +1,31 @@
+{
+  "name": "claude-limits-statusbar",
+  "displayName": "Claude Limits in Status Bar",
+  "description": "Your Claude Pro/Max session (5h) and weekly limits, with reset times, in the VS Code status bar.",
+  "version": "1.0.0",
+  "publisher": "Rivi398",
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": { "type": "git", "url": "https://github.com/Rivi398/claude-limits-kit" },
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "keywords": ["claude", "claude code", "anthropic", "usage", "limits"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "ccusage.refresh", "title": "Claude Limits: Refresh now" }
+    ],
+    "configuration": {
+      "title": "Claude Limits in Status Bar",
+      "properties": {
+        "ccusage.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 60,
+          "description": "How often to refresh, in seconds (the endpoint allows about one request a minute)."
+        }
+      }
+    }
+  }
+}
